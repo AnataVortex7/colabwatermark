@@ -9,6 +9,7 @@ import subprocess, os, sys, uuid, time, threading, asyncio, requests
 # ── Config from Environment Variables ─────────────────────────────────────────
 KOYEB_URL = os.environ.get("KOYEB_URL") or "https://sick-nikaniki-shubham8208989-6d7c863a.koyeb.app"
 COLAB_SECRET = os.environ.get("COLAB_SECRET") or "e000011561fb55e2965b3ec743c658202f1989673"
+UPLOAD_BOT_TOKEN = os.environ.get("UPLOAD_BOT_TOKEN")
 POLL_INTERVAL  = int(os.environ.get('POLL_INTERVAL', '5'))
 FFMPEG_TIMEOUT = int(os.environ.get('FFMPEG_TIMEOUT', '14400'))  # 4 hours
 
@@ -370,7 +371,7 @@ def telegram_send(output_path, job_id, job, api_id, api_hash):
     import tgcrypto
 
     fname = job['file_name']
-    bot_token = job['bot_token']
+    bot_token = UPLOAD_BOT_TOKEN or job['bot_token']
     send_chat_id = job['send_to_chat_id']
     topic_id = job.get('send_to_topic_id') or None
     caption = job.get('caption') or fname
