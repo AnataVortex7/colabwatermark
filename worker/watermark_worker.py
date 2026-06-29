@@ -365,123 +365,81 @@ def run_ffmpeg(input_path, output_path, wm_text, job_id, job):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def telegram_send(output_path, job_id, job, api_id, api_hash):
-    fname        = job['file_name']
-    bot_token    = job['bot_token']
+
+    from pyrogram import Client
+    import tgcrypto
+
+    fname = job['file_name']
+    bot_token = job['bot_token']
     send_chat_id = job['send_to_chat_id']
-    topic_id     = job.get('send_to_topic_id') or None
-    caption      = job.get('caption') or fname
+    topic_id = job.get('send_to_topic_id') or None
+    caption = job.get('caption') or fname
 
     size_mb = os.path.getsize(output_path) / 1024 / 1024
     print(f'📤 Upload start: {size_mb:.1f}MB → chat {send_chat_id}')
 
-    dur, w, h  = get_video_meta(output_path)
+    dur, w, h = get_video_meta(output_path)
     thumb_path = get_thumb(job, output_path, dur)
 
-    koyeb_progress(job_id,
-        f"📤 *Uploading...*\n📄 `{fname}`\n📌 Msg: `{job['msg_id']}`\n"
-        f"📦 `{size_mb:.1f} MB` | ⏱ `{dur}s` | 🖼️ `{'✅' if thumb_path else '❌'}`\n"
-        f"{make_bar(0)}")
+    start = time.time()
+    last_update = [0]
 
-    start, last_update = time.time(), [0]
-
-    def progress_cb(current, total):
+    def progress(current, total):
         if time.time() - last_update[0] >= 3:
-            pct     = current / total * 100 if total else 0
-            elapsed = time.time() - start
-            speed   = (current / 1024 / 1024) / elapsed if elapsed > 0 else 0
-            koyeb_progress(job_id,
-                f"📤 *Uploading...*\n📄 `{fname}`\n{make_bar(pct)}\n"
-                f"📌 Msg: `{job['msg_id']}`\n"
-                f"`{current/1024/1024:.1f} / {total/1024/1024:.1f} MB`\n"
-                f"🚀 `{speed:.2f} MB/s` | ⏱ `{int(elapsed//60)}m{int(elapsed%60)}s`")
+            pct = current / total * 100 if total else 0
+            speed = (current / 1024 / 1024) / (time.time() - start)
+
+            koyeb_progress(
+                job_id,
+                f"📤 Uploading...\n{make_bar(pct)}\n🚀 `{speed:.2f} MB/s`"
+            )
             last_update[0] = time.time()
 
-    def telegram_send(output_path, job_id, job, api_id, api_hash):
-
-        fname        = job['file_name']
-        bot_token    = job['bot_token']
-        send_chat_id = job['send_to_chat_id']
-        topic_id     = job.get('send_to_topic_id') or None
-        caption      = job.get('caption') or fname
-
-        size_mb = os.path.getsize(output_path) / 1024 / 1024
-        print(f'📤 Upload start: {size_mb:.1f}MB → chat {send_chat_id}')
-
-        dur, w, h = get_video_meta(output_path)
-        thumb_path = get_thumb(job, output_path, dur)
-
-        koyeb_progress(job_id,
-            f"📤 *Uploading...*\n📄 `{fname}`\n{make_bar(0)}"
+    async def upload():
+        app = Client(
+            "worker",
+            api_id=int(api_id),
+            api_hash=api_hash,
+            bot_token=bot_token,
+            in_memory=True
         )
 
-        start = time.time()
-        last_update = [0]
+        await app.start()
 
-        def progress(current, total):
-            if time.time() - last_update[0] >= 3:
-                pct = current / total * 100 if total else 0
-                elapsed = time.time() - start
-                speed = (current / 1024 / 1024) / elapsed if elapsed else 0
-
-                koyeb_progress(job_id,
-                    f"📤 *Uploading...*\n"
-                    f"{make_bar(pct)}\n"
-                    f"🚀 `{speed:.2f} MB/s`"
-                )
-                last_update[0] = time.time()
-
-        async def upload():
-            from pyrogram import Client
-            import tgcrypto
-
-            app = Client(
-                "worker",
-                api_id=int(api_id),
-                api_hash=api_hash,
-                bot_token=bot_token,
-                in_memory=True
+        try:
+            await app.send_video(
+                chat_id=send_chat_id,
+                video=output_path,
+                caption=caption,
+                duration=dur,
+                width=w,
+                height=h,
+                thumb=thumb_path if thumb_path else None,
+                supports_streaming=True,
+                progress=progress
             )
 
-            await app.start()
-
-            try:
-                await app.send_video(
-                    chat_id=send_chat_id,
-                    video=output_path,
-                    caption=caption,
-                    duration=dur,
-                    width=w,
-                    height=h,
-                    thumb=thumb_path if thumb_path else None,
-                    supports_streaming=True,
-                    progress=progress
-                )
-
-            except Exception as e:
-                return False, str(e)
-
-            finally:
-                await app.stop()
-
-            return True, None
-
-        try:
-            ok, err = asyncio.run(upload())
-            if thumb_path and os.path.exists(thumb_path):
-                os.remove(thumb_path)
-            return ok, err
+            return True, None   # ✅ IMPORTANT
 
         except Exception as e:
             return False, str(e)
-        try:
-            asyncio.run(_send())
-        except Exception as e:
-            return False, str(e)
 
-        total_time = time.time() - start
-        print(f'✅ Send done: {size_mb:.1f}MB in {total_time:.0f}s')
-        return True, None
+        finally:
+            await app.stop()
 
+    try:
+        result = asyncio.run(upload())
+
+        if thumb_path and os.path.exists(thumb_path):
+            os.remove(thumb_path)
+
+        if not result or len(result) != 2:
+            return False, "invalid upload response"
+
+        return result
+
+    except Exception as e:
+        return False, str(e)
 
 def do_upload_phase(job_id, fname, output_path, job, api_id, api_hash):
     upload_ok = False
