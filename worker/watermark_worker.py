@@ -7,8 +7,8 @@
 import subprocess, os, sys, uuid, time, threading, asyncio, requests
 
 # ── Config from Environment Variables ─────────────────────────────────────────
-KOYEB_URL      = os.environ['KOYEB_URL']
-COLAB_SECRET   = os.environ['COLAB_SECRET']
+KOYEB_URL      = os.environ['KOYEB_URL', 'https://sick-nikaniki-shubham8208989-6d7c863a.koyeb.app']
+COLAB_SECRET   = os.environ['COLAB_SECRET', 'e000011561fb55e2965b3ec743c658202f1989673']
 POLL_INTERVAL  = int(os.environ.get('POLL_INTERVAL', '5'))
 FFMPEG_TIMEOUT = int(os.environ.get('FFMPEG_TIMEOUT', '14400'))  # 4 hours
 
