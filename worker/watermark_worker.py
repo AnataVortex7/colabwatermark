@@ -22,9 +22,9 @@ print(f'⏱ Poll every: {POLL_INTERVAL}s')
 
 # ── Telethon import ────────────────────────────────────────────────────────────
 try:
-    from telethon import TelegramClient
-    from telethon.sessions import StringSession
-    from telethon.tl.types import DocumentAttributeVideo
+    from pyrogram import Client
+    from pyrogram.errors import FloodWait
+    import tgcrypto
 except ImportError:
     subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', 'telethon'], check=True)
     from telethon import TelegramClient
@@ -396,43 +396,91 @@ def telegram_send(output_path, job_id, job, api_id, api_hash):
                 f"🚀 `{speed:.2f} MB/s` | ⏱ `{int(elapsed//60)}m{int(elapsed%60)}s`")
             last_update[0] = time.time()
 
-    async def _send():
-        client = TelegramClient(StringSession(), int(api_id), api_hash)
-        await client.start(bot_token=bot_token)
-        try:
-            try:
-                await client.send_file(
-                    send_chat_id, output_path,
-                    caption=caption, reply_to=topic_id, thumb=thumb_path,
-                    attributes=[DocumentAttributeVideo(
-                        duration=dur, w=w, h=h, supports_streaming=True)],
-                    progress_callback=progress_cb,
-                )
-                print('✅ Streaming video send झालं')
-            except Exception as vid_err:
-                print(f'⚠️ Streaming failed: {vid_err} → Document fallback')
+    def telegram_send(output_path, job_id, job, api_id, api_hash):
+
+        fname        = job['file_name']
+        bot_token    = job['bot_token']
+        send_chat_id = job['send_to_chat_id']
+        topic_id     = job.get('send_to_topic_id') or None
+        caption      = job.get('caption') or fname
+
+        size_mb = os.path.getsize(output_path) / 1024 / 1024
+        print(f'📤 Upload start: {size_mb:.1f}MB → chat {send_chat_id}')
+
+        dur, w, h = get_video_meta(output_path)
+        thumb_path = get_thumb(job, output_path, dur)
+
+        koyeb_progress(job_id,
+            f"📤 *Uploading...*\n📄 `{fname}`\n{make_bar(0)}"
+        )
+
+        start = time.time()
+        last_update = [0]
+
+        def progress(current, total):
+            if time.time() - last_update[0] >= 3:
+                pct = current / total * 100 if total else 0
+                elapsed = time.time() - start
+                speed = (current / 1024 / 1024) / elapsed if elapsed else 0
+
                 koyeb_progress(job_id,
-                    f"⚠️ *Streaming failed → Document...*\n📄 `{fname}`\n`{vid_err}`")
-                await client.send_file(
-                    send_chat_id, output_path,
-                    caption=caption, reply_to=topic_id,
-                    progress_callback=progress_cb,
+                    f"📤 *Uploading...*\n"
+                    f"{make_bar(pct)}\n"
+                    f"🚀 `{speed:.2f} MB/s`"
                 )
-                print('✅ Document fallback send झालं')
-        finally:
-            await client.disconnect()
+                last_update[0] = time.time()
+
+        async def upload():
+            from pyrogram import Client
+            import tgcrypto
+
+            app = Client(
+                "worker",
+                api_id=int(api_id),
+                api_hash=api_hash,
+                bot_token=bot_token,
+                in_memory=True
+            )
+
+            await app.start()
+
+            try:
+                await app.send_video(
+                    chat_id=send_chat_id,
+                    video=output_path,
+                    caption=caption,
+                    duration=dur,
+                    width=w,
+                    height=h,
+                    thumb=thumb_path if thumb_path else None,
+                    supports_streaming=True,
+                    progress=progress
+                )
+
+            except Exception as e:
+                return False, str(e)
+
+            finally:
+                await app.stop()
+
+            return True, None
+
+        try:
+            ok, err = asyncio.run(upload())
             if thumb_path and os.path.exists(thumb_path):
-                try: os.remove(thumb_path)
-                except: pass
+                os.remove(thumb_path)
+            return ok, err
 
-    try:
-        asyncio.run(_send())
-    except Exception as e:
-        return False, str(e)
+        except Exception as e:
+            return False, str(e)
+        try:
+            asyncio.run(_send())
+        except Exception as e:
+            return False, str(e)
 
-    total_time = time.time() - start
-    print(f'✅ Send done: {size_mb:.1f}MB in {total_time:.0f}s')
-    return True, None
+        total_time = time.time() - start
+        print(f'✅ Send done: {size_mb:.1f}MB in {total_time:.0f}s')
+        return True, None
 
 
 def do_upload_phase(job_id, fname, output_path, job, api_id, api_hash):
