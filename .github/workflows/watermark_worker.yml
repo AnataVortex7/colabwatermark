@@ -10,6 +10,15 @@ on:
   schedule:
     - cron: '0 */5 * * *'  # Auto-restart every 5 hours
 
+# ── Concurrency control ──────────────────────────────────────────────────────
+# Cron ने नवीन run सुरू केला की जुना (अजून चालू असलेला) run आपोआप cancel
+# होईल. हे नसेल तर दोन runners एकाच bot_token ने एकाच वेळी Telegram
+# session सुरू करायचा प्रयत्न करतात → Telegram कडून कडक FloodWait (20+ min)
+# येतो, आणि दोन्ही workers एकाच वेळी jobs poll करून race condition होते.
+concurrency:
+  group: tg-watermark-worker
+  cancel-in-progress: true
+
 jobs:
   watermark-worker:
     name: 🎬 Watermark Worker
