@@ -26,6 +26,12 @@ _PERSISTENT_CLIENT = None
 _CLIENT_LOCK = threading.Lock()
 _CLIENT_BOT_TOKEN = None
 
+# ── Warmed-peer cache ────────────────────────────────────────────────────────
+# Ekda warm_peer() call kelya chat_id sathi (persistent client lifetime madhe)
+# parat parat call karaychi garaj nahi. Set madhe (chat_id, bot_token) thevतो
+# karण bot_token badlla tar peer cache pan navin client sobat reset hoto.
+_WARMED_PEERS = set()
+
 # ── Persistent event loop ──────────────────────────────────────────────────
 # Pyrogram Client त्याच्या start() केलेल्या asyncio loop ला bound असतो.
 # प्रत्येक job वेगळ्या thread मध्ये चालतो आणि asyncio.run() नवीन loop
@@ -577,43 +583,100 @@ def telegram_send(output_path, job_id, job, api_id, api_hash):
         except Exception as pe:
             print(f'⚠️ Peer pre-resolve warning ({chat_id}): {pe}')
 
+    async def ensure_warmed(app, chat_id, ahash):
+        """
+        Pratyek distinct chat_id sathi worker lifetime madhe EKDACH warm_peer
+        call karto (set madhe cache karun). Yamule:
+          - Pratyek upload var extra API round-trip nahi (jar aधीच warm zala)
+          - Pan navin/cold chat sathi peer ALWAYS warm hoईl, exception cha
+            fragile string-match (PEER_ID_INVALID text format pratyek
+            pyrogram version/path madhe sarkha nasto) var depend na karता.
+        """
+        cache_key = (chat_id, bot_token)
+        if not ahash or cache_key in _WARMED_PEERS:
+            return
+        await warm_peer(app, chat_id, ahash)
+        _WARMED_PEERS.add(cache_key)
+
     async def upload():
         app = await get_persistent_client(api_id, api_hash, bot_token)
 
         try:
-            # Old code prammaane — pratyek send purvi unconditional warm_peer
-            # (access_hash asel tarच kahi karto, warm_peer cha aatach check ahe)
-            await warm_peer(app, send_chat_id, access_hash)
+            # Pahilyanda (ki tya chat sathi pratyekach) warm_peer guaranteed
+            # call hoईl — exception-string match var bharosa thevत nahi,
+            # karण Pyrogram cha PeerIdInvalid str() format version/path
+            # nusar badlu shakto ani match miss zala tar retry trigger
+            # hot navhता (he च aplya jun्या bug cha root cause hota).
+            await ensure_warmed(app, send_chat_id, access_hash)
 
-            sent_msg = await app.send_video(
-                chat_id=send_chat_id,
-                video=output_path,
-                caption=caption,
-                duration=dur,
-                width=w,
-                height=h,
-                thumb=thumb_path if thumb_path else None,
-                supports_streaming=True,
-                progress=progress
-            )
+            try:
+                sent_msg = await app.send_video(
+                    chat_id=send_chat_id,
+                    video=output_path,
+                    caption=caption,
+                    duration=dur,
+                    width=w,
+                    height=h,
+                    thumb=thumb_path if thumb_path else None,
+                    supports_streaming=True,
+                    progress=progress
+                )
+            except Exception as send_err:
+                # Fallback: kontyahi reason ne peer error aalyas, ekda force
+                # re-warm karun (cache clear karून) retry karto.
+                if access_hash:
+                    print(f'⚠️ Send failed ({send_err}) → access_hash ने force re-resolve करून retry करतोय')
+                    _WARMED_PEERS.discard((send_chat_id, bot_token))
+                    await warm_peer(app, send_chat_id, access_hash)
+                    _WARMED_PEERS.add((send_chat_id, bot_token))
+                    sent_msg = await app.send_video(
+                        chat_id=send_chat_id,
+                        video=output_path,
+                        caption=caption,
+                        duration=dur,
+                        width=w,
+                        height=h,
+                        thumb=thumb_path if thumb_path else None,
+                        supports_streaming=True,
+                        progress=progress
+                    )
+                else:
+                    raise
 
             # ── LOG_CHANNEL backup copy ──────────────────────────────────
             # जुन्या flow मध्ये प्रत्येक file logChannel ला पण कॉपी होत असे.
             # इथे re-upload टाळून, set channel ला आधीच गेलेल्या message ची
             # copy log channel ला पाठवतो (bandwidth वाचतो).
+            print(f'ℹ️ log_chat_id from job: {log_chat_id!r} (access_hash present: {bool(log_access_hash)})')
             if log_chat_id:
                 try:
-                    await warm_peer(app, log_chat_id, log_access_hash)
-                    await app.copy_message(
-                        chat_id=log_chat_id,
-                        from_chat_id=send_chat_id,
-                        message_id=sent_msg.id,
-                        caption=caption,
-                    )
+                    await ensure_warmed(app, log_chat_id, log_access_hash)
+                    try:
+                        await app.copy_message(
+                            chat_id=log_chat_id,
+                            from_chat_id=send_chat_id,
+                            message_id=sent_msg.id,
+                            caption=caption,
+                        )
+                    except Exception as copy_err:
+                        if log_access_hash:
+                            _WARMED_PEERS.discard((log_chat_id, bot_token))
+                            await warm_peer(app, log_chat_id, log_access_hash)
+                            _WARMED_PEERS.add((log_chat_id, bot_token))
+                            await app.copy_message(
+                                chat_id=log_chat_id,
+                                from_chat_id=send_chat_id,
+                                message_id=sent_msg.id,
+                                caption=caption,
+                            )
+                        else:
+                            raise
                     print(f'✅ Log channel backup copied → {log_chat_id}')
                 except Exception as le:
                     # Log backup fail झाला तरी मुख्य upload success मानायचा
+                    import traceback
                     print(f'⚠️ Log channel backup failed: {le}')
+                    traceback.print_exc()
             else:
                 print('⚠️ log_chat_id job मध्ये नाहीये/empty — backup skip')
 
