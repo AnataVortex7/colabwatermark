@@ -368,11 +368,14 @@ def run_ffmpeg(input_path, output_path, wm_text, job_id, job):
 def telegram_send(output_path, job_id, job, api_id, api_hash):
 
     from pyrogram import Client
+    from pyrogram.raw.types import InputChannel
+    from pyrogram.raw.functions.messages import SendMedia
     import tgcrypto
 
     fname = job['file_name']
     bot_token = UPLOAD_BOT_TOKEN or job['bot_token']
     send_chat_id = job['send_to_chat_id']
+    access_hash = job.get('send_to_access_hash', 0)
     topic_id = job.get('send_to_topic_id') or None
     caption = job.get('caption') or fname
 
@@ -408,6 +411,19 @@ def telegram_send(output_path, job_id, job, api_id, api_hash):
         await app.start()
 
         try:
+            # Peer cache warm करा — access_hash असेल तर raw InputChannel वापरा
+            resolved_chat = send_chat_id
+            if access_hash:
+                try:
+                    from pyrogram.raw.types import InputChannel as RawInputChannel
+                    from pyrogram.raw.functions.channels import GetChannels
+                    channel_id = abs(send_chat_id) - 1000000000000
+                    raw_peer = RawInputChannel(channel_id=channel_id, access_hash=access_hash)
+                    await app.invoke(GetChannels(id=[raw_peer]))
+                    print(f'✅ Peer resolved via access_hash: {channel_id}')
+                except Exception as pe:
+                    print(f'⚠️ Peer pre-resolve warning: {pe}')
+
             await app.send_video(
                 chat_id=send_chat_id,
                 video=output_path,
