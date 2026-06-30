@@ -16,6 +16,50 @@ FFMPEG_TIMEOUT = int(os.environ.get('FFMPEG_TIMEOUT', '14400'))  # 4 hours
 HEADERS   = {'X-Secret-Key': COLAB_SECRET}
 WORKER_ID = str(uuid.uuid4())[:12]
 
+# ── Persistent Pyrogram Client cache ──────────────────────────────────────────
+# Pratyek job sathi navin Client + app.start() kelyamule pratyek velela
+# Telegram la "auth.ImportBotAuthorization" (नवीन bot login) call hot hota.
+# Hyala Telegram FloodWait deto (3-4 video nantar 20+ min) — kaaran te
+# repeated-login surakshaa pattern manun treat karte. Fix: ekach client
+# session worker chya संपूर्ण lifetime sathi reuse kara.
+_PERSISTENT_CLIENT = None
+_CLIENT_LOCK = threading.Lock()
+_CLIENT_BOT_TOKEN = None
+
+# ── Persistent event loop ──────────────────────────────────────────────────
+# Pyrogram Client त्याच्या start() केलेल्या asyncio loop ला bound असतो.
+# प्रत्येक job वेगळ्या thread मध्ये चालतो आणि asyncio.run() नवीन loop
+# बनवतो — त्यामुळे persistent client दुसऱ्या loop वर वापरता येणार नाही.
+# Fix: एकच dedicated background thread + त्याचा loop, सगळे Telegram
+# calls त्याच loop वर run_coroutine_threadsafe ने पाठवायचे.
+_TG_LOOP = None
+_TG_LOOP_THREAD = None
+_TG_LOOP_LOCK = threading.Lock()
+
+
+def get_tg_loop():
+    """Telegram operations साठी dedicated persistent event loop+thread."""
+    global _TG_LOOP, _TG_LOOP_THREAD
+    with _TG_LOOP_LOCK:
+        if _TG_LOOP is None or not _TG_LOOP_THREAD.is_alive():
+            _TG_LOOP = asyncio.new_event_loop()
+
+            def _run_loop():
+                asyncio.set_event_loop(_TG_LOOP)
+                _TG_LOOP.run_forever()
+
+            _TG_LOOP_THREAD = threading.Thread(target=_run_loop, daemon=True)
+            _TG_LOOP_THREAD.start()
+            print('✅ Telegram dedicated event loop सुरू झाला')
+        return _TG_LOOP
+
+
+def run_on_tg_loop(coro, timeout=None):
+    """Coroutine ला persistent Telegram loop वर पाठवतो आणि result परत आणतो."""
+    loop = get_tg_loop()
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    return future.result(timeout=timeout)
+
 print(f'🆔 Worker ID : {WORKER_ID}')
 print(f'🌐 Koyeb URL : {KOYEB_URL}')
 print(f'⏱ Poll every: {POLL_INTERVAL}s')
@@ -449,6 +493,41 @@ def run_ffmpeg(input_path, output_path, wm_text, job_id, job):
 # TELEGRAM UPLOADER
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+async def get_persistent_client(api_id, api_hash, bot_token):
+    """
+    Ekach Pyrogram Client session reuse karto संपूर्ण worker lifetime sathi.
+    Navin client फक्त पहिल्यांदा किंवा bot_token बदलला तरच बनतो — yamule
+    repeated bot-login (auth.ImportBotAuthorization) cha FloodWait टळतो.
+    """
+    global _PERSISTENT_CLIENT, _CLIENT_BOT_TOKEN
+
+    with _CLIENT_LOCK:
+        if _PERSISTENT_CLIENT is not None and _CLIENT_BOT_TOKEN == bot_token:
+            return _PERSISTENT_CLIENT
+
+        # bot_token बदलला किंवा client नाही → जुना बंद करून नवीन बनवा
+        if _PERSISTENT_CLIENT is not None:
+            try:
+                await _PERSISTENT_CLIENT.stop()
+            except Exception:
+                pass
+            _PERSISTENT_CLIENT = None
+
+        from pyrogram import Client
+        app = Client(
+            "worker_persistent",
+            api_id=int(api_id),
+            api_hash=api_hash,
+            bot_token=bot_token,
+            in_memory=True
+        )
+        await app.start()
+        _PERSISTENT_CLIENT = app
+        _CLIENT_BOT_TOKEN = bot_token
+        print('✅ Persistent Telegram session सुरू झाला (login एकदाच होईल)')
+        return app
+
+
 def telegram_send(output_path, job_id, job, api_id, api_hash):
 
     from pyrogram import Client
@@ -499,60 +578,88 @@ def telegram_send(output_path, job_id, job, api_id, api_hash):
             print(f'⚠️ Peer pre-resolve warning ({chat_id}): {pe}')
 
     async def upload():
-        app = Client(
-            "worker",
-            api_id=int(api_id),
-            api_hash=api_hash,
-            bot_token=bot_token,
-            in_memory=True
-        )
-
-        await app.start()
+        app = await get_persistent_client(api_id, api_hash, bot_token)
 
         try:
-            # Peer cache warm करा — access_hash असेल तर raw InputChannel वापरा
-            await warm_peer(app, send_chat_id, access_hash)
-
-            sent_msg = await app.send_video(
-                chat_id=send_chat_id,
-                video=output_path,
-                caption=caption,
-                duration=dur,
-                width=w,
-                height=h,
-                thumb=thumb_path if thumb_path else None,
-                supports_streaming=True,
-                progress=progress
-            )
+            # सरळ upload try करा — warm_peer आधीच केलं तर उगाच extra
+            # API round-trip होतो आणि speed/MB-s reading वर परिणाम होतो.
+            # PeerIdInvalid आलं तरच fallback म्हणून peer resolve करतो.
+            try:
+                sent_msg = await app.send_video(
+                    chat_id=send_chat_id,
+                    video=output_path,
+                    caption=caption,
+                    duration=dur,
+                    width=w,
+                    height=h,
+                    thumb=thumb_path if thumb_path else None,
+                    supports_streaming=True,
+                    progress=progress
+                )
+            except Exception as send_err:
+                if 'PEER_ID_INVALID' in str(send_err).upper() and access_hash:
+                    print('⚠️ PeerIdInvalid → access_hash ने resolve करून retry करतोय')
+                    await warm_peer(app, send_chat_id, access_hash)
+                    sent_msg = await app.send_video(
+                        chat_id=send_chat_id,
+                        video=output_path,
+                        caption=caption,
+                        duration=dur,
+                        width=w,
+                        height=h,
+                        thumb=thumb_path if thumb_path else None,
+                        supports_streaming=True,
+                        progress=progress
+                    )
+                else:
+                    raise
 
             # ── LOG_CHANNEL backup copy ──────────────────────────────────
             # जुन्या flow मध्ये प्रत्येक file logChannel ला पण कॉपी होत असे.
             # इथे re-upload टाळून, set channel ला आधीच गेलेल्या message ची
             # copy log channel ला पाठवतो (bandwidth वाचतो).
+            print(f'ℹ️ log_chat_id from job: {log_chat_id!r} (access_hash present: {bool(log_access_hash)})')
             if log_chat_id:
                 try:
-                    await warm_peer(app, log_chat_id, log_access_hash)
-                    await app.copy_message(
-                        chat_id=log_chat_id,
-                        from_chat_id=send_chat_id,
-                        message_id=sent_msg.id,
-                        caption=caption,
-                    )
+                    try:
+                        await app.copy_message(
+                            chat_id=log_chat_id,
+                            from_chat_id=send_chat_id,
+                            message_id=sent_msg.id,
+                            caption=caption,
+                        )
+                    except Exception as copy_err:
+                        if 'PEER_ID_INVALID' in str(copy_err).upper() and log_access_hash:
+                            await warm_peer(app, log_chat_id, log_access_hash)
+                            await app.copy_message(
+                                chat_id=log_chat_id,
+                                from_chat_id=send_chat_id,
+                                message_id=sent_msg.id,
+                                caption=caption,
+                            )
+                        else:
+                            raise
                     print(f'✅ Log channel backup copied → {log_chat_id}')
                 except Exception as le:
                     # Log backup fail झाला तरी मुख्य upload success मानायचा
+                    import traceback
                     print(f'⚠️ Log channel backup failed: {le}')
+                    traceback.print_exc()
+            else:
+                print('⚠️ log_chat_id job मध्ये नाहीये/empty — backup skip')
 
             return True, None   # ✅ IMPORTANT
 
         except Exception as e:
             return False, str(e)
 
-        finally:
-            await app.stop()
+        # ── NOTE: app.stop() इथे करत नाही ──────────────────────────────
+        # Client आता persistent आहे (worker lifetime भर जिवंत राहतो).
+        # प्रत्येक upload नंतर बंद केला तर परत login लागेल आणि FloodWait
+        # येतो. Worker पूर्ण थांबताना (main() च्या शेवटी) बंद होईल.
 
     try:
-        result = asyncio.run(upload())
+        result = run_on_tg_loop(upload(), timeout=FFMPEG_TIMEOUT)
 
         if thumb_path and os.path.exists(thumb_path):
             os.remove(thumb_path)
@@ -675,14 +782,45 @@ def main():
     alive_tick   = 0
     upload_thread = None
 
+    # ── SIGTERM handler ───────────────────────────────────────────────────
+    # GitHub Actions concurrency cancel-in-progress मुळे जुना runner
+    # SIGTERM घेतो (force kill नाही, आधी graceful stop ची संधी देतो).
+    # चालू असलेला upload पूर्ण होऊ देऊन मगच exit करायचा.
+    import signal
+    shutdown_requested = {'flag': False}
+
+    def _handle_sigterm(signum, frame):
+        print('\n🛑 SIGTERM मिळाला (नवीन runner सुरू झाला असेल) — चालू job पूर्ण करून थांबतोय...')
+        shutdown_requested['flag'] = True
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
     while True:
         try:
+            if shutdown_requested['flag']:
+                if upload_thread and upload_thread.is_alive():
+                    print('⏳ चालू upload पूर्ण होण्याची वाट बघतोय (max ~30 min)...')
+                    upload_thread.join(timeout=1800)
+                if _PERSISTENT_CLIENT is not None and _TG_LOOP is not None:
+                    try:
+                        run_on_tg_loop(_PERSISTENT_CLIENT.stop(), timeout=10)
+                    except Exception:
+                        pass
+                print('✅ Worker gracefully stopped (SIGTERM).')
+                break
+
             job, api_id, api_hash, stop = poll_job()
 
             if stop:
                 print('🛑 Stop command received — चालू job पूर्ण करून थांबतोय...')
                 if upload_thread and upload_thread.is_alive():
                     upload_thread.join()
+                # Persistent client best-effort बंद करा (process exit होणारच आहे)
+                if _PERSISTENT_CLIENT is not None and _TG_LOOP is not None:
+                    try:
+                        run_on_tg_loop(_PERSISTENT_CLIENT.stop(), timeout=10)
+                    except Exception:
+                        pass
                 print('✅ Worker stopped by server command.')
                 break
 
