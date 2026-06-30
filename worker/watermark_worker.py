@@ -4,7 +4,7 @@
 # ║       Pipeline: next job download+ffmpeg overlaps with current upload      ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
-import subprocess, os, sys, uuid, time, threading, asyncio, requests
+import subprocess, os, sys, uuid, time, threading, asyncio, requests, re
 
 # ── Config from Environment Variables ─────────────────────────────────────────
 KOYEB_URL = os.environ.get("KOYEB_URL") or "https://sick-nikaniki-shubham8208989-6d7c863a.koyeb.app"
@@ -180,6 +180,59 @@ def koyeb_failed(job_id, error):
     except:
         pass
 
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# FLOODWAIT HANDLING
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def extract_flood_wait_seconds(err):
+    """
+    Pyrogram FloodWait exception (.value attribute) किंवा raw error string
+    ("A wait of 242 seconds is required") दोन्हीतून seconds काढतो.
+    FloodWait नसेल तर None return करतो.
+    """
+    try:
+        from pyrogram.errors import FloodWait
+        if isinstance(err, FloodWait):
+            return int(err.value)
+    except Exception:
+        pass
+
+    err_str = str(err)
+    if 'FLOOD_WAIT' not in err_str.upper() and 'flood' not in err_str.lower():
+        return None
+
+    m = re.search(r'wait of (\d+) seconds', err_str, re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+
+    m = re.search(r'FLOOD_WAIT_(\d+)', err_str.upper())
+    if m:
+        return int(m.group(1))
+
+    return None
+
+
+def wait_with_progress(job_id, fname, total_seconds, reason='FloodWait'):
+    """
+    FloodWait संपेपर्यंत थांबतो आणि दर 30 sec ला Koyeb la remaining time
+    progress म्हणून पाठवतो. job कधीच failed मानला जात नाही — फक्त paused.
+    """
+    print(f'⏳ {reason}: {total_seconds}s थांबतोय (job: {job_id})')
+    remaining = total_seconds
+    while remaining > 0:
+        mins, secs = divmod(remaining, 60)
+        koyeb_progress(
+            job_id,
+            f"⏳ *{reason} — Telegram limit*\n📄 `{fname}`\n"
+            f"⏱ Remaining: `{mins}m {secs}s`\n"
+            f"🔁 आपोआप resume होईल, काही करायची गरज नाही."
+        )
+        sleep_chunk = min(30, remaining)
+        time.sleep(sleep_chunk)
+        remaining -= sleep_chunk
+    print(f'✅ {reason} संपला — resume करतोय (job: {job_id})')
+
 def poll_job():
     try:
         r = requests.get(f'{KOYEB_URL}/api/colab/poll',
@@ -331,7 +384,38 @@ def run_ffmpeg_with_progress(cmd, label, total_dur, job_id, job):
     return True, None
 
 
+def run_ffmpeg_remux_only(input_path, output_path, job_id, job):
+    """Watermark text नसेल तर — फक्त remux (-c copy), re-encode नाही. खूप जलद."""
+    koyeb_progress(job_id,
+        f"📦 *Processing (no watermark)...*\n📄 `{job['file_name']}`\n"
+        f"📌 Msg: `{job['msg_id']}`\n⚙️ `remux (copy)`")
+    cmd = [FFMPEG_BIN, '-i', input_path, '-c', 'copy', '-movflags', '+faststart',
+           '-y', output_path]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=600)
+        if r.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            print('✅ Remux (copy) done — re-encode skip झाला')
+            return True, None
+        err = r.stderr.decode(errors='ignore')[-500:] if r.stderr else 'unknown'
+        print(f'⚠️ Remux copy failed: {err} → fallback to plain file copy')
+        # fallback: ffmpeg remux fail झालं तरी file as-is वापरा
+        import shutil
+        shutil.copyfile(input_path, output_path)
+        return True, None
+    except Exception as e:
+        print(f'⚠️ Remux exception: {e} → fallback to plain file copy')
+        try:
+            import shutil
+            shutil.copyfile(input_path, output_path)
+            return True, None
+        except Exception as e2:
+            return False, str(e2)
+
+
 def run_ffmpeg(input_path, output_path, wm_text, job_id, job):
+    if not wm_text or not wm_text.strip():
+        return run_ffmpeg_remux_only(input_path, output_path, job_id, job)
+
     total_dur = get_duration(input_path)
     safe_text = wm_text.replace("'", "\\'").replace(':', '\\:')
     drawtext  = (f"drawtext=text='{safe_text}':fontcolor=white:fontsize=36:"
@@ -378,6 +462,8 @@ def telegram_send(output_path, job_id, job, api_id, api_hash):
     access_hash = job.get('send_to_access_hash', 0)
     topic_id = job.get('send_to_topic_id') or None
     caption = job.get('caption') or fname
+    log_chat_id = job.get('log_chat_id') or None
+    log_access_hash = job.get('log_access_hash', 0)
 
     size_mb = os.path.getsize(output_path) / 1024 / 1024
     print(f'📤 Upload start: {size_mb:.1f}MB → chat {send_chat_id}')
@@ -399,6 +485,19 @@ def telegram_send(output_path, job_id, job, api_id, api_hash):
             )
             last_update[0] = time.time()
 
+    async def warm_peer(app, chat_id, ahash):
+        if not ahash:
+            return
+        try:
+            from pyrogram.raw.types import InputChannel as RawInputChannel
+            from pyrogram.raw.functions.channels import GetChannels
+            channel_id = abs(chat_id) - 1000000000000
+            raw_peer = RawInputChannel(channel_id=channel_id, access_hash=ahash)
+            await app.invoke(GetChannels(id=[raw_peer]))
+            print(f'✅ Peer resolved via access_hash: {channel_id}')
+        except Exception as pe:
+            print(f'⚠️ Peer pre-resolve warning ({chat_id}): {pe}')
+
     async def upload():
         app = Client(
             "worker",
@@ -412,19 +511,9 @@ def telegram_send(output_path, job_id, job, api_id, api_hash):
 
         try:
             # Peer cache warm करा — access_hash असेल तर raw InputChannel वापरा
-            resolved_chat = send_chat_id
-            if access_hash:
-                try:
-                    from pyrogram.raw.types import InputChannel as RawInputChannel
-                    from pyrogram.raw.functions.channels import GetChannels
-                    channel_id = abs(send_chat_id) - 1000000000000
-                    raw_peer = RawInputChannel(channel_id=channel_id, access_hash=access_hash)
-                    await app.invoke(GetChannels(id=[raw_peer]))
-                    print(f'✅ Peer resolved via access_hash: {channel_id}')
-                except Exception as pe:
-                    print(f'⚠️ Peer pre-resolve warning: {pe}')
+            await warm_peer(app, send_chat_id, access_hash)
 
-            await app.send_video(
+            sent_msg = await app.send_video(
                 chat_id=send_chat_id,
                 video=output_path,
                 caption=caption,
@@ -435,6 +524,24 @@ def telegram_send(output_path, job_id, job, api_id, api_hash):
                 supports_streaming=True,
                 progress=progress
             )
+
+            # ── LOG_CHANNEL backup copy ──────────────────────────────────
+            # जुन्या flow मध्ये प्रत्येक file logChannel ला पण कॉपी होत असे.
+            # इथे re-upload टाळून, set channel ला आधीच गेलेल्या message ची
+            # copy log channel ला पाठवतो (bandwidth वाचतो).
+            if log_chat_id:
+                try:
+                    await warm_peer(app, log_chat_id, log_access_hash)
+                    await app.copy_message(
+                        chat_id=log_chat_id,
+                        from_chat_id=send_chat_id,
+                        message_id=sent_msg.id,
+                        caption=caption,
+                    )
+                    print(f'✅ Log channel backup copied → {log_chat_id}')
+                except Exception as le:
+                    # Log backup fail झाला तरी मुख्य upload success मानायचा
+                    print(f'⚠️ Log channel backup failed: {le}')
 
             return True, None   # ✅ IMPORTANT
 
@@ -460,17 +567,36 @@ def telegram_send(output_path, job_id, job, api_id, api_hash):
 
 def do_upload_phase(job_id, fname, output_path, job, api_id, api_hash):
     upload_ok = False
+    err = None
     try:
-        for attempt in range(1, 4):
+        attempt = 1
+        max_attempts = 3
+        flood_retries = 0
+        max_flood_retries = 20  # सलग खूप जास्त FloodWait आल्यास infinite loop टाळायला cap
+
+        while attempt <= max_attempts:
             if attempt > 1:
                 koyeb_progress(job_id,
-                    f"🔄 *Upload retry {attempt}/3...*\n📄 `{fname}`")
+                    f"🔄 *Upload retry {attempt}/{max_attempts}...*\n📄 `{fname}`")
                 time.sleep(15)
+
             ok, err = telegram_send(output_path, job_id, job, api_id, api_hash)
             if ok:
                 upload_ok = True
                 break
+
+            wait_secs = extract_flood_wait_seconds(err)
+            if wait_secs is not None:
+                flood_retries += 1
+                if flood_retries > max_flood_retries:
+                    print(f'❌ FloodWait खूप वेळा आला ({flood_retries}x) — job fail मानतोय')
+                    break
+                # FloodWait → attempt counter वाढवत नाही, फक्त थांबून परत तोच attempt करतो
+                wait_with_progress(job_id, fname, wait_secs + 5, reason='FloodWait')
+                continue
+
             print(f'❌ Upload attempt {attempt} failed: {err}')
+            attempt += 1
 
         if not upload_ok:
             koyeb_failed(job_id, err)
