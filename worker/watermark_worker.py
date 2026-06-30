@@ -583,7 +583,7 @@ def telegram_send(output_path, job_id, job, api_id, api_hash):
         except Exception as pe:
             print(f'⚠️ Peer pre-resolve warning ({chat_id}): {pe}')
 
-    async def ensure_warmed(chat_id, ahash):
+    async def ensure_warmed(app, chat_id, ahash):
         """
         Pratyek distinct chat_id sathi worker lifetime madhe EKDACH warm_peer
         call karto (set madhe cache karun). Yamule:
@@ -607,7 +607,7 @@ def telegram_send(output_path, job_id, job, api_id, api_hash):
             # karण Pyrogram cha PeerIdInvalid str() format version/path
             # nusar badlu shakto ani match miss zala tar retry trigger
             # hot navhता (he च aplya jun्या bug cha root cause hota).
-            await ensure_warmed(send_chat_id, access_hash)
+            await ensure_warmed(app, send_chat_id, access_hash)
 
             try:
                 sent_msg = await app.send_video(
@@ -650,7 +650,7 @@ def telegram_send(output_path, job_id, job, api_id, api_hash):
             print(f'ℹ️ log_chat_id from job: {log_chat_id!r} (access_hash present: {bool(log_access_hash)})')
             if log_chat_id:
                 try:
-                    await ensure_warmed(log_chat_id, log_access_hash)
+                    await ensure_warmed(app, log_chat_id, log_access_hash)
                     try:
                         await app.copy_message(
                             chat_id=log_chat_id,
